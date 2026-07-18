@@ -16,6 +16,7 @@
 #include <linux/qcom_scm.h>
 #include <asm/cacheflush.h>
 #include <linux/qtee_shmbridge.h>
+#include <linux/thermal.h>
 
 #include "governor.h"
 #include "msm_adreno_devfreq.h"
@@ -57,6 +58,23 @@ static DEFINE_SPINLOCK(suspend_lock);
 static u64 suspend_time;
 static u64 suspend_start;
 static unsigned long acc_total, acc_relative_busy;
+
+/*
+ * DYNAMIC THERMAL STAGES (Adjustable on the fly via sysfs)
+ * Default values as requested:
+ * */
+
+static unsigned int throttle_temp_1 = 65;
+static unsigned long throttle_freq_1 = 615000000;
+
+static unsigned int throttle_temp_2 = 70;
+static unsigned long throttle_freq_2 = 550000000;
+
+static unsigned int throttle_temp_3 = 72;
+static unsigned long throttle_freq_3 = 475000000;
+
+static unsigned int throttle_temp_4 = 75;
+static unsigned long throttle_freq_4 = 348000000;
 
 /*
  * Returns GPU suspend time in millisecond.
@@ -149,15 +167,48 @@ static ssize_t mod_percent_show(struct device *dev,
 	return scnprintf(buf, PAGE_SIZE, "%u\n", priv->mod_percent);
 }
 
-static DEVICE_ATTR_RO(gpu_load);
+/* Makros zur schnellen Erstellung der Sysfs-Schnittstellen */
+#define SHOW_SET_UINT(name, var) \
+static ssize_t name##_show(struct device *dev, struct device_attribute *attr, char *buf) \
+{ return scnprintf(buf, PAGE_SIZE, "%u\n", var); } \
+static ssize_t name##_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count) \
+{ int r = kstrtou32(buf, 0, &var); return r ? r : count; } \
+static DEVICE_ATTR_RW(name);
 
+#define SHOW_SET_ULONG(name, var) \
+static ssize_t name##_show(struct device *dev, struct device_attribute *attr, char *buf) \
+{ return scnprintf(buf, PAGE_SIZE, "%lu\n", var); } \
+static ssize_t name##_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count) \
+{ int r = kstrtoul(buf, 0, &var); return r ? r : count; } \
+static DEVICE_ATTR_RW(name);
+
+/* Generiere Lese- und Schreib-Knoten für die Stufen */
+SHOW_SET_UINT(throttle_temp_1, throttle_temp_1)
+SHOW_SET_ULONG(throttle_freq_1, throttle_freq_1)
+SHOW_SET_UINT(throttle_temp_2, throttle_temp_2)
+SHOW_SET_ULONG(throttle_freq_2, throttle_freq_2)
+SHOW_SET_UINT(throttle_temp_3, throttle_temp_3)
+SHOW_SET_ULONG(throttle_freq_3, throttle_freq_3)
+SHOW_SET_UINT(throttle_temp_4, throttle_temp_4)
+SHOW_SET_ULONG(throttle_freq_4, throttle_freq_4)
+
+static DEVICE_ATTR_RO(gpu_load);
 static DEVICE_ATTR_RO(suspend_time);
 static DEVICE_ATTR_RW(mod_percent);
 
+/* Registrierung im Sysfs des Treibers */
 static const struct device_attribute *adreno_tz_attr_list[] = {
 		&dev_attr_gpu_load,
 		&dev_attr_suspend_time,
 		&dev_attr_mod_percent,
+		&dev_attr_throttle_temp_1,
+		&dev_attr_throttle_freq_1,
+		&dev_attr_throttle_temp_2,
+		&dev_attr_throttle_freq_2,
+		&dev_attr_throttle_temp_3,
+		&dev_attr_throttle_freq_3,
+		&dev_attr_throttle_temp_4,
+		&dev_attr_throttle_freq_4,
 		NULL
 };
 
@@ -350,10 +401,45 @@ static int tz_get_target_freq(struct devfreq *devfreq, unsigned long *freq)
 	int context_count = 0;
 	u64 busy_time;
 
+	/* Variables for capturing the SoC skin temperature */
+	int tsens_temp = 0;
+	struct thermal_zone_device *zone;
+	unsigned long requested_freq = 0;
+
 	if (!priv)
 		return 0;
+      /*
+     * ENFORCED THERMAL BRAKE: Moved to the absolute beginning!
+     * Intercepts frequency requests before Qualcomm binning modes
+     * or TrustZone services take control.
+     */
+	zone = thermal_zone_get_zone_by_name("gpuss-1");
+	if (!IS_ERR_OR_NULL(zone)) {
+		if (thermal_zone_get_temp(zone, &tsens_temp) == 0) {
+			int current_celsius = tsens_temp / 1000;
 
-	/* keeps stats.private_data == NULL   */
+			if (current_celsius >= (int)throttle_temp_4) {
+				requested_freq = throttle_freq_4;
+			} else if (current_celsius >= (int)throttle_temp_3) {
+				requested_freq = throttle_freq_3;
+			} else if (current_celsius >= (int)throttle_temp_2) {
+				requested_freq = throttle_freq_2;
+			} else if (current_celsius >= (int)throttle_temp_1) {
+				requested_freq = throttle_freq_1;
+			}
+
+			/* If a brake is triggered, we enforce it via the frequency table */
+			if (requested_freq > 0) {
+				int target_level = devfreq_get_freq_level(devfreq, requested_freq);
+				if (target_level >= 0) {
+					*freq = devfreq->profile->freq_table[target_level];
+					return 0; // Instantly terminates the function successfully!
+				}
+			}
+		}
+	}
+
+	/* From here on follows the original Qualcomm calculation path */
 	result = devfreq_update_stats(devfreq);
 	if (result) {
 		pr_err(TAG "get_status failed %d\n", result);
